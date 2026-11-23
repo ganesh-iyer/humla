@@ -60,6 +60,221 @@ pub struct AppState {
     pub unify_locks: Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
+/// Start a recording from the rashek:// trigger (URL scheme or tray "New
+/// Recording"), driven entirely from Rust. The frontend deliberately does NOT
+/// create the note or start recording anymore: as a menu-bar / accessory app,
+/// rashek often has no live webview to receive an emitted event, so the
+/// create-note+record flow can't depend on one. We create the note, kick off
+/// `recording_start`, and — for the case where a window IS open — show it and
+/// emit "rashek-open-note" so the UI navigates to the new note.
+pub(crate) fn trigger_record(app: &tauri::AppHandle) {
+    // Ignore a re-fire while a recording is already live. macOS can deliver the
+    // same deep-link twice, and the tray item can be double-clicked; without
+    // this guard a second trigger creates a fresh note and `recording_start`'s
+    // self-heal SIGTERMs the first sidecar — silently killing the recording the
+    // user just started. If a window exists, surface it instead.
+    if app.state::<AppState>().recording.lock().note_id.is_some() {
+        eprintln!("rashek trigger: already recording — ignoring re-fire");
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+        return;
+    }
+    let note = match commands::notes_create(app.state::<AppState>()) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("rashek trigger: notes_create failed: {}", e);
+            return;
+        }
+    };
+    let note_id = note.id.clone();
+    // Reflect in a live UI if one exists (harmless no-op when headless).
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+    let _ = app.emit("rashek-open-note", note_id.clone());
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app2.state::<AppState>();
+        if let Err(e) = commands::recording_start(app2.clone(), state, note_id).await {
+            eprintln!("rashek trigger: recording_start failed: {}", e);
+        }
+    });
+}
+
+/// Stop the active recording from the rashek://stop trigger, driven from Rust
+/// for the same reason as [`trigger_record`]. `recording_stop` is the authority
+/// on whether anything is actually recording.
+fn trigger_stop(app: &tauri::AppHandle) {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app2.state::<AppState>();
+        if let Err(e) = commands::recording_stop(app2.clone(), state).await {
+            eprintln!("rashek trigger: recording_stop failed: {}", e);
+        }
+    });
+}
+
+/// Watch the default mic for use (a meeting app grabbing it) via the sidecar's
+/// permission-free `watch-mic` mode, and float the meeting prompt on the
+/// idle→active edge when rashek isn't already recording. Restarts the watcher if
+/// it ever dies. This is the problem-5 detector.
+fn start_mic_watch(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let path = match commands::sidecar_path(&app) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("mic-watch: sidecar path: {e}");
+                return;
+            }
+        };
+        loop {
+            let mut child = match tokio::process::Command::new(&path)
+                .arg("watch-mic")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("mic-watch: spawn: {e}");
+                    return;
+                }
+            };
+            let stdout = match child.stdout.take() {
+                Some(s) => s,
+                None => return,
+            };
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("mic-watch: read {line}");
+                if line.contains("\"state\":\"active\"") {
+                    let already_recording = {
+                        let st = app.state::<AppState>();
+                        let r = st.recording.lock().note_id.is_some();
+                        r
+                    };
+                    eprintln!("mic-watch: active — recording={already_recording} → {}", if already_recording { "skip" } else { "FIRE" });
+                    if !already_recording {
+                        let a = app.clone();
+                        let _ = app.run_on_main_thread(move || show_meeting_prompt(&a));
+                    }
+                }
+            }
+            eprintln!("mic-watch: watcher exited; restarting in 2s");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+/// Show the floating meeting prompt, positioned top-right of the primary
+/// display. Must be called on the main thread (window ops).
+pub(crate) fn show_meeting_prompt(app: &tauri::AppHandle) {
+    use tauri::{Manager, PhysicalPosition};
+    if let Some(w) = app.get_webview_window("meeting-prompt") {
+        if let Ok(Some(mon)) = w.primary_monitor() {
+            let sz = mon.size();
+            let scale = mon.scale_factor();
+            let win_w = (380.0 * scale) as i32;
+            let margin = (8.0 * scale) as i32;
+            let top = (36.0 * scale) as i32; // clear the menu bar
+            let x = sz.width as i32 - win_w - margin;
+            let _ = w.set_position(PhysicalPosition::new(x, top));
+        }
+        let _ = w.set_visible_on_all_workspaces(true);
+        let _ = w.show();
+        let _ = w.set_always_on_top(true);
+        // Tell the card to (re)arm its silent auto-dismiss for THIS show.
+        use tauri::Emitter;
+        let _ = w.emit("meeting-prompt-show", ());
+    }
+}
+
+/// "Take notes" tapped on the floating prompt → hide it and start recording.
+#[tauri::command]
+fn meeting_prompt_accept(app: tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("meeting-prompt") {
+        let _ = w.hide();
+    }
+    trigger_record(&app);
+}
+
+/// Prompt ignored or timed out → just hide it.
+#[tauri::command]
+fn meeting_prompt_dismiss(app: tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("meeting-prompt") {
+        let _ = w.hide();
+    }
+}
+
+/// Position the recording indicator top-right of the primary display with an
+/// initial size. The frontend measures the pill and calls `indicator_resize` to
+/// fit it exactly, so this size is just a starting point (avoids a first-frame
+/// clip before the measure lands).
+fn place_indicator(w: &tauri::WebviewWindow) {
+    use tauri::{LogicalSize, PhysicalPosition};
+    let (lw, lh) = (210.0, 54.0);
+    let _ = w.set_size(LogicalSize::new(lw, lh));
+    if let Ok(Some(mon)) = w.primary_monitor() {
+        let sz = mon.size();
+        let scale = mon.scale_factor();
+        let pw = (lw * scale) as i32;
+        let margin = (10.0 * scale) as i32;
+        let top = (36.0 * scale) as i32; // clear the menu bar
+        let x = sz.width as i32 - pw - margin;
+        let _ = w.set_position(PhysicalPosition::new(x, top));
+    }
+}
+
+/// Show or hide the recording indicator. Safe to call from any thread — window
+/// work is dispatched to the main thread.
+pub(crate) fn set_recording_indicator(app: &tauri::AppHandle, show: bool) {
+    let app = app.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        use tauri::{Emitter, Manager};
+        if let Some(w) = app.get_webview_window("recording-indicator") {
+            if show {
+                place_indicator(&w);
+                // Follow the user across Spaces / full-screen apps (three-finger
+                // swipe), like Granola — the pill stays put instead of vanishing.
+                let _ = w.set_visible_on_all_workspaces(true);
+                let _ = w.show();
+                let _ = w.set_always_on_top(true);
+                let _ = w.emit("recording-indicator-show", ());
+            } else {
+                let _ = w.hide();
+            }
+        }
+    });
+}
+
+/// Resize the indicator window to exactly fit the pill the frontend measured
+/// (width/height in logical px). Keeps the RIGHT edge fixed at the window's
+/// CURRENT position, so it never clips AND survives the user dragging the pill.
+#[tauri::command]
+fn indicator_resize(app: tauri::AppHandle, w: f64, h: f64) {
+    use tauri::{LogicalSize, Manager, PhysicalPosition};
+    if let Some(win) = app.get_webview_window("recording-indicator") {
+        let scale = win.scale_factor().unwrap_or(2.0);
+        let old_pos = win.outer_position().ok();
+        let old_size = win.outer_size().ok();
+        let _ = win.set_size(LogicalSize::new(w.max(60.0), h.max(30.0)));
+        if let (Some(pos), Some(osz)) = (old_pos, old_size) {
+            let new_w_px = (w * scale).round() as i32;
+            let right = pos.x + osz.width as i32;
+            let _ = win.set_position(PhysicalPosition::new(right - new_w_px, pos.y));
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // With the `cloud` feature (default), install the live cloud-sync observer:
@@ -84,10 +299,127 @@ where
 {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_deep_link::init())
         .setup(move |app| {
+            // rashek:// URL-scheme trigger (problem 5). `rashek://record` and
+            // `rashek://stop` arrive here; forward each to the frontend, which
+            // runs the create-note+record / stop flow. At runtime also register
+            // the scheme so `open rashek://...` reaches a running instance.
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                let _ = app.deep_link().register("rashek");
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        let s = url.to_string();
+                        eprintln!("rashek deep-link: {}", s);
+                        let lower = s.to_lowercase();
+                        // Drive record/stop from RUST (see trigger_record): a
+                        // menu-bar app may have no live webview to handle an
+                        // emitted event, so we must not route the actual work
+                        // through the frontend.
+                        if lower.contains("record") {
+                            trigger_record(&handle);
+                        } else if lower.contains("stop") {
+                            trigger_stop(&handle);
+                        }
+                    }
+                });
+            }
+            // Problem 6: run as a menu-bar / background app. Accessory policy
+            // removes the Dock icon; a tray icon provides access. The window
+            // hides instead of quitting (RunEvent below), so rashek stays
+            // resident — which is exactly the stable, always-running condition
+            // the rashek:// trigger needs to fire reliably.
+            #[cfg(target_os = "macos")]
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            {
+                use tauri::menu::{MenuBuilder, MenuItemBuilder};
+                use tauri::tray::TrayIconBuilder;
+                use tauri::{Emitter, Manager};
+                let show = MenuItemBuilder::with_id("show", "Open rashek.humla").build(app)?;
+                let record = MenuItemBuilder::with_id("record", "New Recording").build(app)?;
+                let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+                let menu = MenuBuilder::new(app).items(&[&show, &record, &quit]).build()?;
+                // Menu-bar glyph: the Lucide Lab bee (Humla = Norwegian for
+                // bumblebee), rendered as a monochrome template so macOS inverts
+                // it for the light/dark menu bar.
+                let bee = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-bee.png"))?;
+                let _tray = TrayIconBuilder::with_id("rashek-tray")
+                    .icon(bee)
+                    .icon_as_template(true)
+                    .tooltip("rashek.humla")
+                    .menu(&menu)
+                    .on_menu_event(move |app, event| match event.id().as_ref() {
+                        "show" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "record" => {
+                            trigger_record(app);
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .build(app)?;
+            }
+            // Floating meeting-prompt window (problem 5): a borderless,
+            // transparent, always-on-top, non-activating panel the mic-watch
+            // detector shows to offer recording. Built hidden so a later show is
+            // instant. It's a plain window — NOT a system notification — so it
+            // ignores Focus/Do-Not-Disturb and draws its own countdown, the way
+            // Granola does. The frontend renders only the prompt card in the
+            // window labelled "meeting-prompt" (see main.tsx).
+            {
+                use tauri::{WebviewUrl, WebviewWindowBuilder};
+                let _prompt = WebviewWindowBuilder::new(
+                    app,
+                    "meeting-prompt",
+                    WebviewUrl::App("index.html".into()),
+                )
+                .title("rashek meeting prompt")
+                .inner_size(380.0, 150.0)
+                .decorations(false)
+                .transparent(true)
+                .shadow(false) // kill the macOS window shadow — the card draws its own
+                .always_on_top(true)
+                .resizable(false)
+                .skip_taskbar(true)
+                .focused(false)
+                .visible(false)
+                .build()?;
+
+                // Mic-watch detector (problem 5): float the prompt when a
+                // meeting grabs the mic and rashek isn't already recording.
+                start_mic_watch(&app.handle().clone());
+            }
+            // Floating recording indicator (problem 5 / OI-236): a borderless,
+            // always-on-top pill shown WHILE recording, so the capture is
+            // visible without opening the main window. Built hidden; shown on
+            // record-start, hidden on idle (see commands.rs recording lifecycle).
+            {
+                use tauri::{WebviewUrl, WebviewWindowBuilder};
+                let _ind = WebviewWindowBuilder::new(
+                    app,
+                    "recording-indicator",
+                    WebviewUrl::App("index.html".into()),
+                )
+                .title("rashek recording")
+                .inner_size(210.0, 54.0)
+                .decorations(false)
+                .transparent(true)
+                .shadow(false)
+                .always_on_top(true)
+                .resizable(false)
+                .skip_taskbar(true)
+                .focused(false)
+                .visible(false)
+                .build()?;
+            }
             // Point GGML at our prebuilt default.metallib BEFORE any
             // whisper.cpp init runs. whisper-rs 0.13 ships a vendored
             // ggml whose runtime Metal-source compile path silently
@@ -237,6 +569,9 @@ where
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            meeting_prompt_accept,
+            meeting_prompt_dismiss,
+            indicator_resize,
             commands::notes_list,
             commands::notes_get,
             commands::notes_create,
@@ -326,7 +661,21 @@ where
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri app")
-        .run(|_app_handle, event| {
+        .run(|app_handle, event| {
+            use tauri::Manager;
+            // Window close hides instead of quitting, so rashek stays resident
+            // in the menu bar (problem 6). Quit is via the tray's Quit item.
+            if let tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } = &event
+            {
+                api.prevent_close();
+                if let Some(w) = app_handle.get_webview_window(label) {
+                    let _ = w.hide();
+                }
+            }
             // Bypass C++ static destructors on quit. whisper.cpp's GGML
             // Metal backend dispatches a background block during init that
             // polls via usleep; on app exit, the unique_ptr<ggml_metal_device>

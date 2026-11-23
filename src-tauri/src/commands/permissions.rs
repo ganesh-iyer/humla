@@ -16,15 +16,30 @@ pub struct PermissionsStatus {
 
 async fn run_sidecar_cmd(app: &AppHandle, mode: &str) -> Result<String, String> {
     let path = super::sidecar_path(app)?;
-    let mut child = tokio::process::Command::new(&path)
-        .arg(mode)
+    let mut cmd = tokio::process::Command::new(&path);
+    cmd.arg(mode)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawn: {e}"))?;
+        .kill_on_drop(true);
+    // Detach into a new session so macOS TCC attributes the mic / screen
+    // authorization to the SIDECAR's own binary identity — the SAME identity
+    // `recording_start` records under (it also setsid's the sidecar). Without
+    // this, status and request ran under humla's identity while recording ran
+    // under the sidecar's, so a granted permission was never seen by the
+    // recorder — the "Microphone permission required" dead end.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            let _ = libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    // A `request-*` prompt blocks on the user's click — give it room. `status`
+    // is instant.
+    let secs = if mode.starts_with("request") { 120 } else { 3 };
     let fut = child.wait_with_output();
-    match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
         Ok(Ok(out)) => Ok(String::from_utf8_lossy(&out.stdout).to_string()),
         Ok(Err(e)) => Err(format!("read: {e}")),
         Err(_) => Err("sidecar timed out".into()),

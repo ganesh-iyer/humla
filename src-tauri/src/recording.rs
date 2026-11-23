@@ -308,6 +308,10 @@ pub enum SidecarEvent {
         mic_peak: f32,
         sys_peak: f32,
     },
+    // ~10Hz live audio level (0..1) for the recording indicator's waveform.
+    Level {
+        level: f32,
+    },
     // Non-fatal notice from the sidecar — e.g. it recovered mic capture after
     // an audio device change mid-recording. Surfaced to the user as a transient
     // toast (see the reader loop in commands.rs).

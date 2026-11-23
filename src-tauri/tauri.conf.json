@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Humla",
+  "productName": "rashek.humla",
   "version": "0.33.0",
-  "identifier": "no.humla.app",
+  "identifier": "no.humla.rashek",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -33,25 +33,18 @@
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "targets": ["app", "dmg"],
     "icon": ["icons/icon.png"],
     "macOS": {
       "minimumSystemVersion": "13.0",
       "entitlements": "entitlements.plist",
-      "signingIdentity": "Developer ID Application: MICHAEL MEHLUM WILHELMSEN (NBUP88JQ35)"
+      "signingIdentity": "rashek-humla-dev"
     },
     "externalBin": ["binaries/audio-capture", "binaries/speaker-diarize"],
     "resources": {
       "resources/default.metallib": "default.metallib"
     }
   },
-  "plugins": {
-    "updater": {
-      "endpoints": [
-        "https://github.com/michaelwilhelmsen/humla/releases/latest/download/latest.json"
-      ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJDMjkzMDJGQjYxQTcyQTMKUldTamNocTJMekFwTEhISnRDNmJqemxSaHo3ejdmcFVZODYrMFdjaGQwNnUxTnVhczE1Skd5L2wK"
-    }
-  }
+  "plugins": {}
 }

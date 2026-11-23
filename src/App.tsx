@@ -17,6 +17,7 @@ import { SettingsDialog } from "./pages/settings/SettingsDialog";
 import { Onboarding } from "./pages/onboarding";
 import { ipc } from "./lib/ipc";
 import { useGlobalShortcuts } from "./lib/shortcuts";
+import { useDeepLinkTrigger } from "./lib/deeplink";
 import { bindBackendListeners, useNotesStore } from "./lib/store";
 import { useCloudStore } from "./lib/cloud";
 import { useThemeBoot } from "./lib/theme";
@@ -24,6 +25,7 @@ import { usePaletteBoot } from "./lib/palette";
 
 export default function App() {
   useGlobalShortcuts();
+  useDeepLinkTrigger();
   useThemeBoot();
   usePaletteBoot();
   const refresh = useNotesStore((s) => s.refresh);

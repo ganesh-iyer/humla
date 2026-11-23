@@ -61,15 +61,20 @@ chmod +x "$DEST"
 
 xattr -cr "$DEST" || true
 
-if [[ -n "$IDENTITY" ]] && security find-identity -v -p codesigning | grep -qF "$IDENTITY"; then
+# Match WITHOUT `-v`: our signing identity is a self-signed, deliberately
+# untrusted local cert (rashek-humla-dev). `-v` lists only trusted identities,
+# so it would never find ours and we'd silently fall back to ad-hoc — which is
+# exactly what kept invalidating the TCC (mic / system-audio) grant on every
+# rebuild. A stable identity, trusted or not, is all TCC needs. No --timestamp:
+# it needs network and buys us nothing for a local identity.
+if [[ -n "$IDENTITY" ]] && security find-identity -p codesigning | grep -qF "$IDENTITY"; then
   echo "signing sidecar with: $IDENTITY"
   codesign --force --options runtime \
     --sign "$IDENTITY" \
     --entitlements "$ENTITLEMENTS" \
-    --timestamp \
     "$DEST"
 else
-  echo "warning: Developer ID identity not in Keychain, falling back to ad-hoc signing"
+  echo "warning: signing identity '$IDENTITY' not in Keychain, falling back to ad-hoc signing"
   codesign --force --sign - "$DEST"
 fi
 

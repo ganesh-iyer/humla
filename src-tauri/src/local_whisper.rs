@@ -438,6 +438,16 @@ pub async fn transcribe_file_segments(
         params.set_temperature(0.0);
         params.set_no_speech_thold(preset.no_speech_thold());
         params.set_logprob_thold(-1.0);
+        // Anti-hallucination on noisy/near-silent audio (music, room noise), the
+        // classic Whisper failure that fills gaps with "*music*", subtitle
+        // credits, and runaway "*word* *word*" loops:
+        //  - suppress_nst: don't emit non-speech tokens (the *asterisk* markers).
+        //  - no_context:  don't carry the previous segment's (possibly
+        //    hallucinated) text into the next as internal context, which is what
+        //    lets a repetition loop feed on itself. The entity-vocab
+        //    initial_prompt is set separately and still applies.
+        params.set_suppress_nst(true);
+        params.set_no_context(true);
         // Token-level timestamps drive the playback view's word-by-word
         // highlight. Cheap on Apple Silicon (~1% extra) since the model
         // already produces token logits; this just exposes them.

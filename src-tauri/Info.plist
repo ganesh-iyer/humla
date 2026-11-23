@@ -6,5 +6,18 @@
     <string>Humla records your microphone during meetings to transcribe and summarize them.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Humla captures system audio (the other side of meetings) to transcribe and summarize them. No video is recorded.</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>no.humla.rashek</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>rashek</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

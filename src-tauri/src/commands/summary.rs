@@ -98,11 +98,32 @@ fn resolve_provider(
 #[tauri::command]
 pub async fn summarize_note(app: AppHandle, note_id: String) -> Result<(), String> {
     eprintln!("[llm] summarize_note invoked for note={note_id}");
-    // Per-note `summary_status` channel keeps the summary spinner from
-    // touching `recording_status`. Summarising note B while note A
-    // records used to wipe A's recording state on completion (`note_id:
-    // None, Phase::Idle` on the shared channel); the dedicated event
-    // makes the two lifecycles independent.
+    // rashek is Claude-first. Unless the user has EXPLICITLY configured a local
+    // OpenAI-compatible server (Ollama / LM Studio / llama-server), the manual
+    // "Summarize" button uses the SAME headless-Claude generator as the
+    // post-stop pipeline — so it never demands an OpenAI key. The default
+    // (empty provider) therefore routes to Claude, not OpenAI. That generator
+    // manages its own summary_status + summary_ready events.
+    let provider = {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        let note = db::get_note(&conn, &note_id).map_err(|e| e.to_string())?;
+        let ov = note.summary_provider.trim().to_string();
+        if ov.is_empty() {
+            db::get_setting(&conn, "summary_provider").ok().flatten().unwrap_or_default()
+        } else {
+            ov
+        }
+    };
+    if provider != "local" {
+        super::gen_notes_via_claude(app, note_id).await;
+        return Ok(());
+    }
+    // Local OpenAI-compatible server path — unchanged. Per-note `summary_status`
+    // channel keeps the summary spinner from touching `recording_status`.
+    // Summarising note B while note A records used to wipe A's recording state
+    // on completion (`note_id: None, Phase::Idle` on the shared channel); the
+    // dedicated event makes the two lifecycles independent.
     emit_summary_status(&app, &note_id, true);
     let result = run_summary(app.clone(), note_id.clone()).await;
     emit_summary_status(&app, &note_id, false);

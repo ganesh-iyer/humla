@@ -88,8 +88,10 @@ const DEFAULT_SILENCE_RMS_THRESHOLD: f32 = 0.005;
 // the post-stop pipeline and are deleted at the end. When this is on,
 // the audio-capture full WAVs are copied to <app_data>/recordings/<note_id>/
 // before cleanup so the user can re-run diarize at different thresholds,
-// or just listen back. Privacy posture stays opt-in.
-const DEFAULT_KEEP_AUDIO: &str = "false";
+// or just listen back. rashek default: ON — as a personal Granola replacement
+// it should keep the source audio so Re-diarize works without the user having
+// to remember to toggle it first (upstream Humla ships this opt-in / "false").
+const DEFAULT_KEEP_AUDIO: &str = "true";
 
 // Bounded backlog for the import reader loop. An `--import` replay emits chunks
 // at full disk speed — far faster than realtime — so without a bound the reader
@@ -1482,16 +1484,43 @@ pub async fn recording_start(
     // present) and fire the local-Whisper prewarm. Shared with `import_audio`.
     ensure_provider_ready(&app, &state, &note_id).await?;
 
-    // Pre-check microphone permission — without it we can't capture anything useful.
-    if let Ok(p) = permissions_status(app.clone()).await {
-        if p.microphone != "granted" {
-            let msg = "Microphone permission required. Open Settings → Permissions to grant.".to_string();
-            emit_error(&app, Some(&note_id), &msg);
-            return Err(msg);
-        }
-        if p.screen != "granted" {
-            emit_error(&app, Some(&note_id),
-                "Screen Recording not granted — only your microphone will be captured. Grant in Settings → Permissions and restart for the full meeting transcript.");
+    // Pre-check microphone permission — without it we can't capture anything
+    // useful. If it isn't granted yet, actively REQUEST it: the sidecar (under
+    // its own detached identity) surfaces the macOS prompt and waits for the
+    // user, then we re-check. This is what makes the menu-bar trigger able to
+    // obtain the grant on first use, since there's no onboarding UI in that
+    // flow. Only a hard denial (or dismissal) after the prompt aborts.
+    //
+    // Latency: once we've confirmed the grant in this session, SKIP the whole
+    // check. It spawns a separate `status` sidecar (~1–2 s) every time, which
+    // otherwise delays the real capture sidecar and clips the first seconds of
+    // audio. The grant persists (stable signing identity), so one check is
+    // enough; a mid-session revoke is rare and the capture sidecar would still
+    // surface it.
+    let mic_known_granted = {
+        let conn = state.db.lock();
+        db::get_setting(&conn, "mic_granted").ok().flatten().as_deref() == Some("true")
+    };
+    if !mic_known_granted {
+        if let Ok(mut p) = permissions_status(app.clone()).await {
+            if p.microphone != "granted" {
+                if let Ok(p2) = permissions_request(app.clone(), "microphone".to_string()).await {
+                    p = p2;
+                }
+            }
+            if p.microphone != "granted" {
+                let msg = "Microphone permission required. Open Settings → Permissions to grant.".to_string();
+                emit_error(&app, Some(&note_id), &msg);
+                return Err(msg);
+            }
+            {
+                let conn = state.db.lock();
+                let _ = db::set_setting(&conn, "mic_granted", "true");
+            }
+            if p.screen != "granted" {
+                emit_error(&app, Some(&note_id),
+                    "Screen Recording not granted — only your microphone will be captured. Grant in Settings → Permissions and restart for the full meeting transcript.");
+            }
         }
     }
 
@@ -1520,6 +1549,13 @@ pub async fn recording_start(
     let sidecar_path = sidecar_path(&app)?;
     let mut cmd = Command::new(&sidecar_path);
     cmd.arg("--out").arg(&temp_dir);
+    // Pass our real PID so the sidecar's parent-death watchdog can monitor
+    // *this* process's liveness directly. It can't rely on its own PPID: we
+    // setsid() it below, and when humla is launched detached (menu-bar /
+    // LaunchServices) macOS reparents the sidecar to launchd (PID 1) almost
+    // immediately while humla is very much alive — a PPID==1 test would then
+    // kill an active recording ~2 s in.
+    cmd.arg("--parent-pid").arg(std::process::id().to_string());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
@@ -1692,6 +1728,10 @@ pub async fn recording_start(
     }
 
     emit_status(&app, Some(&note_id), Phase::Recording);
+    // Float the recording indicator pill (problem 5 / OI-236). Shown once at
+    // start so a resume (which also emits Recording) doesn't reset its timer;
+    // hidden centrally in emit_status on Phase::Idle.
+    crate::set_recording_indicator(&app, true);
     Ok(())
 }
 
@@ -1930,7 +1970,136 @@ async fn run_post_stop_chain(
     if let Some(dir) = temp_dir {
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
+    // rashek: generate the meeting notes from the finalized transcript via
+    // headless Claude (gen-notes.py). Runs in the background and self-delays
+    // ~10 s, so it never blocks the chain reaching Idle. The nightly harvest
+    // (harvest-rashek.py) is now import-only — this is where generation lives.
+    {
+        let app_gen = app.clone();
+        let note_gen = note_id.clone();
+        tokio::spawn(async move { generate_notes_post_stop(app_gen, note_gen).await; });
+    }
     emit_status(&app, None, Phase::Idle);
+}
+
+/// Absolute path to the fillory note generator. rashek is a personal build, so
+/// this couples to the user's threads layout deliberately (the generator needs
+/// the entity vocabulary + house-style prompt that live there).
+const GEN_NOTES_PY: &str = "/Users/ganesh/Documents/threads/.scripts/gen-notes.py";
+const GEN_NOTES_PYTHON: &str = "/opt/homebrew/bin/python3";
+
+/// Post-stop note generation (rashek, problem 5). ~10 s after a recording's
+/// transcript is finalized, feed it to `gen-notes.py` (which reuses the fillory
+/// entity vocabulary + threads house-style prompt + headless Claude) and write
+/// the returned title + notes into the note's `title` + `summary`, plus the
+/// entity-corrected transcript. Emits `summary_ready` so the UI shows the notes.
+/// Best-effort throughout: any failure leaves the transcript intact.
+async fn generate_notes_post_stop(app: AppHandle, note_id: String) {
+    // The user asked for generation ~10 s after stop (a sanity settle).
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    gen_notes_via_claude(app, note_id).await;
+}
+
+/// Generate house-style notes for a note from its transcript via the shared
+/// `gen-notes.py` (headless Claude) generator, then write title + notes +
+/// normalized transcript back. This is the SAME engine the post-stop pipeline
+/// uses; the manual "Summarize" button routes here too (see
+/// commands::summary::summarize_note) so it never demands an OpenAI key.
+pub(crate) async fn gen_notes_via_claude(app: AppHandle, note_id: String) {
+    let state: State<AppState> = app.state();
+    let transcript = {
+        let conn = state.db.lock();
+        match db::get_note(&conn, &note_id) {
+            Ok(n) => n.transcript,
+            Err(e) => {
+                eprintln!("gen-notes: get_note failed: {e}");
+                return;
+            }
+        }
+    };
+    if transcript.trim().len() < 100 {
+        eprintln!("gen-notes: transcript too short ({}), skipping", transcript.trim().len());
+        return;
+    }
+
+    // Signal the UI that a summary is being produced (reuses the summary spinner).
+    let _ = app.emit("summary_status", crate::recording::SummaryStatusPayload {
+        note_id: note_id.clone(),
+        active: true,
+    });
+
+    let mut child = match tokio::process::Command::new(GEN_NOTES_PYTHON)
+        .arg(GEN_NOTES_PY)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("gen-notes: spawn failed: {e}");
+            let _ = app.emit("summary_status", crate::recording::SummaryStatusPayload { note_id, active: false });
+            return;
+        }
+    };
+    if let Some(mut si) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = si.write_all(transcript.as_bytes()).await;
+        let _ = si.shutdown().await; // close stdin so gen-notes.py's read() returns
+    }
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(320), child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => { eprintln!("gen-notes: wait failed: {e}"); let _ = app.emit("summary_status", crate::recording::SummaryStatusPayload { note_id, active: false }); return; }
+        Err(_) => { eprintln!("gen-notes: timed out"); let _ = app.emit("summary_status", crate::recording::SummaryStatusPayload { note_id, active: false }); return; }
+    };
+    let done = |app: &AppHandle, id: &str| {
+        let _ = app.emit("summary_status", crate::recording::SummaryStatusPayload { note_id: id.to_string(), active: false });
+    };
+    if !out.status.success() {
+        eprintln!("gen-notes: exit {:?}: {}", out.status.code(), String::from_utf8_lossy(&out.stderr).trim());
+        done(&app, &note_id);
+        return;
+    }
+    // gen-notes.py prints one JSON object on the last stdout line.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{')).unwrap_or("");
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("gen-notes: bad JSON ({e}): {line}"); done(&app, &note_id); return; }
+    };
+    let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let notes = v.get("notes").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let normalized = v.get("normalized_transcript").and_then(|x| x.as_str()).map(|s| s.to_string());
+    if notes.is_empty() {
+        eprintln!("gen-notes: empty notes for {note_id}");
+        done(&app, &note_id);
+        return;
+    }
+    {
+        let conn = state.db.lock();
+        let patch = db::NotePatch {
+            title: if title.is_empty() { None } else { Some(title.clone()) },
+            summary: Some(notes.clone()),
+            transcript: normalized,
+            ..Default::default()
+        };
+        if let Err(e) = db::update_note(&conn, &note_id, &patch) {
+            eprintln!("gen-notes: update_note failed: {e}");
+            done(&app, &note_id);
+            return;
+        }
+    }
+    state.sync.note_upserted(&note_id);
+    let _ = app.emit("summary_ready", crate::recording::SummaryPayload {
+        note_id: note_id.clone(),
+        summary: notes,
+    });
+    // summary_ready only updates the open note's summary panel; the generation
+    // also rewrote the TITLE, so nudge a full list refetch too — otherwise the
+    // note stays "Untitled" with a transcript preview in the sidebar.
+    let _ = app.emit("notes_changed", ());
+    done(&app, &note_id);
+    eprintln!("gen-notes: generated notes for {note_id} (title={title:?})");
 }
 
 /// Resolve the active transcription provider for `note_id`'s language and
@@ -2096,6 +2265,11 @@ async fn dispatch_sidecar_event(
                 mic_peak,
                 sys_peak,
             });
+            false
+        }
+        SidecarEvent::Level { level } => {
+            // Fast live-waveform tick for the recording indicator.
+            let _ = app.emit("recording_level", level);
             false
         }
         SidecarEvent::Diagnostic { message } => {
@@ -4870,6 +5044,12 @@ async fn transcribe_chunk(
 }
 
 fn emit_status(app: &AppHandle, note_id: Option<&str>, phase: Phase) {
+    // Hide the floating recording indicator whenever we return to Idle — covers
+    // the normal post-stop path AND crash/error cleanup paths, all of which emit
+    // Idle. Show is explicit at record-start (see recording_start).
+    if matches!(phase, Phase::Idle) {
+        crate::set_recording_indicator(app, false);
+    }
     let _ = app.emit("recording_status", RecordingStatus {
         note_id: note_id.map(|s| s.to_string()),
         phase,
@@ -4906,7 +5086,7 @@ fn session_changed_for_sync(app: &AppHandle, note_id: &str, session_id: &str) {
     app.state::<AppState>().sync.session_upserted(note_id, session_id);
 }
 
-fn sidecar_path(_app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn sidecar_path(_app: &AppHandle) -> Result<PathBuf, String> {
     // 1) Production / `tauri build`: Tauri copies external binaries next to
     //    the main executable inside the .app bundle's MacOS folder, with the
     //    triple suffix stripped. So look for ../MacOS/audio-capture first.
